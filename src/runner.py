@@ -21,6 +21,7 @@ Design decisions worth knowing (put these in your README):
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -230,6 +231,11 @@ class PipelineRunner:
 
         Jitter matters: without it, many clients retrying at the same moment
         hit the API in a synchronized wave and keep failing together.
+
+        BACKOFF_DISABLED=1 turns the sleep off so the test suite does not
+        spend 15 seconds proving that retries wait.
         """
+        if os.getenv("BACKOFF_DISABLED") == "1":
+            return 0.0
         base = min(2 ** attempt, 30)
         return base * (0.5 + random.random() * 0.5)
