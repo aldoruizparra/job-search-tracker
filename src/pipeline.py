@@ -56,6 +56,16 @@ def get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(max_retries=0, timeout=60.0)
 
 
+def is_offline() -> bool:
+    """True when no Anthropic credential is configured.
+
+    Offline mode lets the service run end to end without a key (for demos,
+    or anyone cloning the repo): LLM steps return placeholder output at zero
+    cost instead of failing every job.
+    """
+    return not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+
+
 def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     in_rate, out_rate = PRICING[model]
     return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
@@ -136,6 +146,18 @@ def extract(job, prior):
     text = (prior or {}).get("text", "")
     if not text:
         raise StepFailed("no text to extract from")
+
+    if is_offline():
+        log.warning("extract running offline, no API key", extra={"job_id": job.id})
+        return no_cost({
+            "title": None,
+            "company": None,
+            "required_skills": [],
+            "preferred_skills": [],
+            "years_experience": None,
+            "location": None,
+            "salary_range": None,
+        })
 
     # Fail before paying for a call we could not price.
     if EXTRACT_MODEL not in PRICING:

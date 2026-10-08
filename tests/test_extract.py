@@ -75,6 +75,32 @@ def test_unpriced_model_fails_before_calling_the_api(fake_anthropic, monkeypatch
     assert fake_anthropic.calls == []
 
 
+def test_offline_mode_returns_placeholder_without_calling_the_api(
+    fake_anthropic, monkeypatch
+):
+    monkeypatch.setattr(pipeline, "is_offline", lambda: True)
+    result = extract(JOB, PRIOR)
+
+    assert result["output"]["required_skills"] == []
+    assert result["output"]["title"] is None
+    assert result["cost_usd"] == 0.0
+    assert fake_anthropic.calls == []
+
+
+@pytest.mark.parametrize(
+    "env,offline",
+    [({}, True), ({"ANTHROPIC_API_KEY": "x"}, False), ({"ANTHROPIC_AUTH_TOKEN": "x"}, False)],
+    ids=["no_credential", "api_key", "auth_token"],
+)
+def test_offline_detection(monkeypatch, env, offline):
+    monkeypatch.undo()   # drop the autouse is_offline override
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert pipeline.is_offline() is offline
+
+
 # ------------------------------------------------------ retryable failures
 
 

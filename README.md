@@ -139,12 +139,12 @@ tests/
   conftest.py       disables retry backoff, fakes the Anthropic client
   test_runner.py    10 tests on the execution engine
   test_api.py       11 tests on the HTTP layer
-  test_extract.py   15 tests on the extract step's API error handling
+  test_extract.py   19 tests on extract error handling and offline mode
 ```
 
 ## Tests
 
-**36 tests, all passing, under a second.** No test touches the network: an
+**40 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 
 Two of them carry the project:
@@ -177,10 +177,18 @@ python -m pytest tests/ -v
 ```
 
 ```
-36 passed in 0.40s
+40 passed in 0.41s
 ```
 
-Start the service. `extract` needs an Anthropic API key:
+Start the service:
+
+```bash
+python -m uvicorn src.api:app --reload
+```
+
+With no API key set, the service runs in **offline mode**: `extract` returns
+placeholder output (empty skill lists, null fields) at zero cost, so the whole
+pipeline can be exercised without an Anthropic account. To make real calls:
 
 ```bash
 cp .env.example .env               # then set ANTHROPIC_API_KEY

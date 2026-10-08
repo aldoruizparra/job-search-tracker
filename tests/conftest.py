@@ -65,4 +65,6 @@ def fake_anthropic(monkeypatch):
     messages = FakeMessages()
     client = SimpleNamespace(beta=SimpleNamespace(messages=messages))
     monkeypatch.setattr(pipeline, "get_client", lambda: client)
+    # Behave as if a key is configured, regardless of the real environment.
+    monkeypatch.setattr(pipeline, "is_offline", lambda: False)
     return messages
