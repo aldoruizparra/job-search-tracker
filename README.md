@@ -6,8 +6,8 @@ persisted before and after execution, so a crash resumes from the last completed
 step instead of re-running expensive LLM calls.
 
 **Status: in progress.** The persistence layer, pipeline runner, and HTTP API are
-built and tested. The step handlers are stubs with their output shapes fixed;
-real LLM calls are next.
+built and tested. `extract` makes a real Anthropic call; `compare` and `score`
+are still stubs with their output shapes fixed.
 
 ## The problem
 
@@ -95,10 +95,29 @@ postings a day, so the simpler thing is correct. If this ever needs to absorb
 bursts, the runner moves behind a queue and the endpoint returns `202` with a
 job id instead. The runner itself would not change.
 
-**Step handlers are stubs with fixed output shapes.** `extract`, `compare`, and
-`score` return the right structure with placeholder values. Swapping in real
-Anthropic calls replaces their bodies only; the runner, API, and tests stay as
-they are.
+**The runner owns retries, not the SDK.** The Anthropic client is built with
+`max_retries=0`. With the SDK default of 2, each runner attempt could hide three
+API calls, so the `attempts` column would undercount what was actually paid and
+the runner's jittered backoff would stack on top of the SDK's own.
+
+**API errors are classified, not caught wholesale.** In `extract`, rate limits,
+timeouts, connection errors, and 5xx (including 529 overloaded) become
+`StepFailed` and are retried. A 400, 401, or 404, a refusal, a response
+truncated at `max_tokens`, or output that does not parse all propagate. Retrying
+those spends three attempts reproducing the same failure.
+
+**The output shape is enforced by the API.** `extract` uses structured outputs
+with a JSON schema matching the shape the `compare` step was written against,
+so a well-formed response cannot drift from it.
+
+**Cost is priced by the model that served the call.** Requests opt into
+server-side refusal fallbacks, which can route a declined request to another
+model. Cost is computed from `response.model`, not the requested one. An
+unpriced model fails before the call rather than after paying for it.
+
+**`compare` and `score` are still stubs with fixed output shapes.** Swapping in
+real calls replaces their bodies only; the runner, API, and tests stay as they
+are.
 
 **SQLite for now.** Single user, single process, no concurrency pressure. The
 SQLAlchemy models move to Postgres unchanged if that assumption breaks.
@@ -117,14 +136,16 @@ src/
   db.py         engine and session setup
   api.py        FastAPI endpoints and startup recovery
 tests/
-  conftest.py       disables retry backoff so the suite runs in ~1s
+  conftest.py       disables retry backoff, fakes the Anthropic client
   test_runner.py    10 tests on the execution engine
   test_api.py       11 tests on the HTTP layer
+  test_extract.py   15 tests on the extract step's API error handling
 ```
 
 ## Tests
 
-**21 tests, all passing, ~1 second.**
+**36 tests, all passing, under a second.** No test touches the network: an
+autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 
 Two of them carry the project:
 
@@ -137,6 +158,11 @@ second time.
 boots the app through `TestClient` so the lifespan handler fires, and asserts the
 job completed **and** that the already-done step still shows `attempts == 0`.
 That is the same guarantee, proven at the HTTP layer rather than in isolation.
+
+`test_extract.py` covers the failure mapping for the real LLM call: each
+transient API error becomes a retry, each client error, refusal, truncation,
+and malformed response does not, and a rate-limited extract retried through the
+real runner records three attempts but bills one call.
 
 Also covered: retry on transient failure, dead-letter after exhausted attempts,
 dead-letter jobs not silently retrying, cost rollup, output threading between
@@ -151,13 +177,14 @@ python -m pytest tests/ -v
 ```
 
 ```
-21 passed in 1.08s
+36 passed in 0.40s
 ```
 
-Start the service:
+Start the service. `extract` needs an Anthropic API key:
 
 ```bash
-python -m uvicorn src.api:app --reload
+cp .env.example .env               # then set ANTHROPIC_API_KEY
+python -m uvicorn src.api:app --reload --env-file .env
 ```
 
 Interactive docs at `http://localhost:8000/docs`.
@@ -170,7 +197,8 @@ curl -X POST localhost:8000/jobs \
 
 ## What is next
 
-- [ ] Real LLM calls in `extract`, `compare`, and `score` via the Anthropic API
+- [x] Real LLM call in `extract` via the Anthropic API
+- [ ] Real LLM calls in `compare` and `score`
 - [ ] URL ingestion with timeout and bot-detection handling
 - [ ] Resume parsing to feed the comparison step
 - [ ] Structured JSON logging with `job_id` on every line
@@ -180,4 +208,3 @@ curl -X POST localhost:8000/jobs \
 ## Stack
 
 Python, FastAPI, SQLAlchemy, SQLite, pytest, Anthropic API.
-[text](../Downloads/conftest.py)

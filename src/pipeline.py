@@ -12,15 +12,53 @@ Every handler has the same contract:
 Raise StepFailed for anything retryable (timeout, rate limit, transient 5xx).
 Let other exceptions propagate: those are bugs, not conditions to retry.
 
-The extract/compare/score handlers are stubs right now. Weekend 2 replaces
-their bodies with real Anthropic API calls. The runner does not change.
+extract makes a real Anthropic call. compare and score are still stubs with
+their output shapes fixed; replacing them changes handler bodies only.
 """
 
+import json
 import logging
+import os
+from functools import lru_cache
+
+import anthropic
 
 from .runner import StepFailed
 
 log = logging.getLogger("pipeline")
+
+EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "claude-opus-5-5")
+
+# USD per million tokens, (input, output). Cost is priced off response.model,
+# not the requested model, because a server-side fallback can change which
+# model actually served the call. Opus 5 and Opus 4.8 are the fallback targets.
+PRICING = {
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+
+class ModelRefused(Exception):
+    """The model declined the request. Not retryable: same input, same answer."""
+
+
+@lru_cache(maxsize=1)
+def get_client() -> anthropic.Anthropic:
+    """Shared client, built on first use so importing this module needs no key.
+
+    max_retries=0 because the runner owns retries. With the SDK's default of
+    2, every runner attempt would hide up to three API calls, and the
+    attempts column on the step row would undercount what we actually paid.
+    """
+    return anthropic.Anthropic(max_retries=0, timeout=60.0)
+
+
+def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    in_rate, out_rate = PRICING[model]
+    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
 
 
 def no_cost(output: dict) -> dict:
@@ -40,7 +78,7 @@ def ingest(job, prior):
         # Not retryable: no amount of trying fixes a job with no input.
         raise ValueError(f"job {job.id} has neither raw_text nor source_url")
 
-    # Weekend 2: real fetch with timeout handling and bot-detection fallback.
+    # Next: real fetch with timeout handling and bot-detection fallback.
     # Job boards block scrapers aggressively, so this is where StepFailed
     # will actually get raised in practice.
     raise StepFailed("URL ingestion not implemented yet, paste the text instead")
@@ -49,27 +87,98 @@ def ingest(job, prior):
 # --------------------------------------------------------------- extract
 
 
-def extract(job, prior):
-    """Pull structured requirements out of the posting text.
+def _nullable(kind: str) -> dict:
+    return {"anyOf": [{"type": kind}, {"type": "null"}]}
 
-    Becomes an LLM call. Shape of the output is fixed now so the compare
-    step can be written against it.
+
+# Structured outputs constrain the response to this schema, so the shape the
+# compare step was written against is enforced by the API, not by hope.
+REQUIREMENTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": _nullable("string"),
+        "company": _nullable("string"),
+        "required_skills": {"type": "array", "items": {"type": "string"}},
+        "preferred_skills": {"type": "array", "items": {"type": "string"}},
+        "years_experience": _nullable("integer"),
+        "location": _nullable("string"),
+        "salary_range": _nullable("string"),
+    },
+    "required": [
+        "title", "company", "required_skills", "preferred_skills",
+        "years_experience", "location", "salary_range",
+    ],
+    "additionalProperties": False,
+}
+
+EXTRACT_SYSTEM = """\
+You extract structured requirements from a job posting.
+
+required_skills are skills the posting says a candidate must have.
+preferred_skills are ones it calls nice-to-have, preferred, or a plus.
+Name each skill as a short canonical term ("Kubernetes", not "experience
+running Kubernetes in production") so the same skill matches across
+postings. years_experience is the minimum number of years asked for.
+salary_range is the range as written, including currency.
+
+Use null for any field the posting does not state. Do not infer or guess."""
+
+
+def extract(job, prior):
+    """Pull structured requirements out of the posting text with one LLM call.
+
+    Failure mapping, which is the part that matters:
+      rate limit, timeout, connection error, 5xx  ->  StepFailed (retry)
+      any other API error (400, 401, 404, ...)    ->  propagates (a bug)
+      refusal                                     ->  ModelRefused (propagates)
+      truncated or unparseable output             ->  propagates (a bug)
     """
     text = (prior or {}).get("text", "")
     if not text:
         raise StepFailed("no text to extract from")
 
-    stub = {
-        "title": None,
-        "company": None,
-        "required_skills": [],
-        "preferred_skills": [],
-        "years_experience": None,
-        "location": None,
-        "salary_range": None,
+    # Fail before paying for a call we could not price.
+    if EXTRACT_MODEL not in PRICING:
+        raise ValueError(f"no pricing for model {EXTRACT_MODEL}")
+
+    try:
+        response = get_client().beta.messages.create(
+            model=EXTRACT_MODEL,
+            max_tokens=16000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            output_config={
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": REQUIREMENTS_SCHEMA},
+            },
+            system=EXTRACT_SYSTEM,
+            messages=[{"role": "user", "content": text}],
+        )
+    # APITimeoutError subclasses APIConnectionError, so this covers both.
+    except (anthropic.RateLimitError, anthropic.APIConnectionError) as exc:
+        raise StepFailed(f"{type(exc).__name__}: {exc}") from exc
+    except anthropic.InternalServerError as exc:   # 5xx, including 529 overloaded
+        raise StepFailed(f"server error {exc.status_code}: {exc}") from exc
+
+    if response.stop_reason == "refusal":
+        raise ModelRefused(f"extract refused: {response.stop_details}")
+    if response.stop_reason == "max_tokens":
+        raise ValueError("extract output truncated at max_tokens")
+
+    body = next(b.text for b in response.content if b.type == "text")
+    requirements = json.loads(body)
+
+    usage = response.usage
+    log.info(
+        "extract done",
+        extra={"job_id": job.id, "model": response.model, "chars": len(text)},
+    )
+    return {
+        "output": requirements,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cost_usd": cost_usd(response.model, usage.input_tokens, usage.output_tokens),
     }
-    log.info("extract stub", extra={"job_id": job.id, "chars": len(text)})
-    return no_cost(stub)
 
 
 # --------------------------------------------------------------- compare
