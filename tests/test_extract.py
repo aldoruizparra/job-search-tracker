@@ -17,9 +17,10 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from conftest import FAKE_REQUIREMENTS, make_response
-from src import pipeline
+from src import llm, pipeline
 from src.models import Base, Job, JobStatus
-from src.pipeline import STEPS, ModelRefused, extract
+from src.llm import ModelRefused
+from src.pipeline import STEPS, extract
 from src.runner import PipelineRunner, StepFailed
 
 REQUEST = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
@@ -69,7 +70,7 @@ def test_cost_is_priced_by_the_model_that_served_the_call(fake_anthropic):
 
 
 def test_unpriced_model_fails_before_calling_the_api(fake_anthropic, monkeypatch):
-    monkeypatch.setattr(pipeline, "EXTRACT_MODEL", "claude-unknown")
+    monkeypatch.setattr(llm, "MODEL", "claude-unknown")
     with pytest.raises(ValueError, match="no pricing"):
         extract(JOB, PRIOR)
     assert fake_anthropic.calls == []
@@ -78,7 +79,7 @@ def test_unpriced_model_fails_before_calling_the_api(fake_anthropic, monkeypatch
 def test_offline_mode_returns_placeholder_without_calling_the_api(
     fake_anthropic, monkeypatch
 ):
-    monkeypatch.setattr(pipeline, "is_offline", lambda: True)
+    monkeypatch.setattr(llm, "is_offline", lambda: True)
     result = extract(JOB, PRIOR)
 
     assert result["output"]["required_skills"] == []
@@ -98,7 +99,7 @@ def test_offline_detection(monkeypatch, env, offline):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    assert pipeline.is_offline() is offline
+    assert llm.is_offline() is offline
 
 
 # ------------------------------------------------------ retryable failures

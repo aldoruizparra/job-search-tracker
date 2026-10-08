@@ -12,63 +12,17 @@ Every handler has the same contract:
 Raise StepFailed for anything retryable (timeout, rate limit, transient 5xx).
 Let other exceptions propagate: those are bugs, not conditions to retry.
 
-extract makes a real Anthropic call. compare and score are still stubs with
-their output shapes fixed; replacing them changes handler bodies only.
+extract makes a real Anthropic call through llm.structured_call, which owns
+the error mapping. compare and score are still stubs with their output shapes
+fixed; replacing them changes handler bodies only.
 """
 
-import json
 import logging
-import os
-from functools import lru_cache
 
-import anthropic
-
+from . import llm
 from .runner import StepFailed
 
 log = logging.getLogger("pipeline")
-
-EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "claude-opus-5-5")
-
-# USD per million tokens, (input, output). Cost is priced off response.model,
-# not the requested model, because a server-side fallback can change which
-# model actually served the call. Opus 5 and Opus 4.8 are the fallback targets.
-PRICING = {
-    "claude-opus-5-5": (4.00, 20.00),
-    "claude-opus-5": (5.00, 25.00),
-    "claude-opus-4-8": (5.00, 25.00),
-    "claude-sonnet-5-5": (2.00, 10.00),
-    "claude-haiku-5-5": (0.10, 0.50),
-}
-
-
-class ModelRefused(Exception):
-    """The model declined the request. Not retryable: same input, same answer."""
-
-
-@lru_cache(maxsize=1)
-def get_client() -> anthropic.Anthropic:
-    """Shared client, built on first use so importing this module needs no key.
-
-    max_retries=0 because the runner owns retries. With the SDK's default of
-    2, every runner attempt would hide up to three API calls, and the
-    attempts column on the step row would undercount what we actually paid.
-    """
-    return anthropic.Anthropic(max_retries=0, timeout=60.0)
-
-
-def is_offline() -> bool:
-    """True when no Anthropic credential is configured.
-
-    Offline mode lets the service run end to end without a key (for demos,
-    or anyone cloning the repo): LLM steps return placeholder output at zero
-    cost instead of failing every job.
-    """
-    return not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
-
-
-def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    in_rate, out_rate = PRICING[model]
-    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
 
 
 def no_cost(output: dict) -> dict:
@@ -97,22 +51,18 @@ def ingest(job, prior):
 # --------------------------------------------------------------- extract
 
 
-def _nullable(kind: str) -> dict:
-    return {"anyOf": [{"type": kind}, {"type": "null"}]}
-
-
 # Structured outputs constrain the response to this schema, so the shape the
 # compare step was written against is enforced by the API, not by hope.
 REQUIREMENTS_SCHEMA = {
     "type": "object",
     "properties": {
-        "title": _nullable("string"),
-        "company": _nullable("string"),
+        "title": llm.nullable("string"),
+        "company": llm.nullable("string"),
         "required_skills": {"type": "array", "items": {"type": "string"}},
         "preferred_skills": {"type": "array", "items": {"type": "string"}},
-        "years_experience": _nullable("integer"),
-        "location": _nullable("string"),
-        "salary_range": _nullable("string"),
+        "years_experience": llm.nullable("integer"),
+        "location": llm.nullable("string"),
+        "salary_range": llm.nullable("string"),
     },
     "required": [
         "title", "company", "required_skills", "preferred_skills",
@@ -135,19 +85,12 @@ Use null for any field the posting does not state. Do not infer or guess."""
 
 
 def extract(job, prior):
-    """Pull structured requirements out of the posting text with one LLM call.
-
-    Failure mapping, which is the part that matters:
-      rate limit, timeout, connection error, 5xx  ->  StepFailed (retry)
-      any other API error (400, 401, 404, ...)    ->  propagates (a bug)
-      refusal                                     ->  ModelRefused (propagates)
-      truncated or unparseable output             ->  propagates (a bug)
-    """
+    """Pull structured requirements out of the posting text with one LLM call."""
     text = (prior or {}).get("text", "")
     if not text:
         raise StepFailed("no text to extract from")
 
-    if is_offline():
+    if llm.is_offline():
         log.warning("extract running offline, no API key", extra={"job_id": job.id})
         return no_cost({
             "title": None,
@@ -159,48 +102,12 @@ def extract(job, prior):
             "salary_range": None,
         })
 
-    # Fail before paying for a call we could not price.
-    if EXTRACT_MODEL not in PRICING:
-        raise ValueError(f"no pricing for model {EXTRACT_MODEL}")
-
-    try:
-        response = get_client().beta.messages.create(
-            model=EXTRACT_MODEL,
-            max_tokens=16000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            output_config={
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": REQUIREMENTS_SCHEMA},
-            },
-            system=EXTRACT_SYSTEM,
-            messages=[{"role": "user", "content": text}],
-        )
-    # APITimeoutError subclasses APIConnectionError, so this covers both.
-    except (anthropic.RateLimitError, anthropic.APIConnectionError) as exc:
-        raise StepFailed(f"{type(exc).__name__}: {exc}") from exc
-    except anthropic.InternalServerError as exc:   # 5xx, including 529 overloaded
-        raise StepFailed(f"server error {exc.status_code}: {exc}") from exc
-
-    if response.stop_reason == "refusal":
-        raise ModelRefused(f"extract refused: {response.stop_details}")
-    if response.stop_reason == "max_tokens":
-        raise ValueError("extract output truncated at max_tokens")
-
-    body = next(b.text for b in response.content if b.type == "text")
-    requirements = json.loads(body)
-
-    usage = response.usage
+    result = llm.structured_call(EXTRACT_SYSTEM, text, REQUIREMENTS_SCHEMA)
     log.info(
         "extract done",
-        extra={"job_id": job.id, "model": response.model, "chars": len(text)},
+        extra={"job_id": job.id, "model": result["model"], "chars": len(text)},
     )
-    return {
-        "output": requirements,
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cost_usd": cost_usd(response.model, usage.input_tokens, usage.output_tokens),
-    }
+    return result
 
 
 # --------------------------------------------------------------- compare

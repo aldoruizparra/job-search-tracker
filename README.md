@@ -6,8 +6,8 @@ persisted before and after execution, so a crash resumes from the last completed
 step instead of re-running expensive LLM calls.
 
 **Status: in progress.** The persistence layer, pipeline runner, and HTTP API are
-built and tested. `extract` makes a real Anthropic call; `compare` and `score`
-are still stubs with their output shapes fixed.
+built and tested. `extract` and resume parsing make real Anthropic calls;
+`compare` and `score` are still stubs with their output shapes fixed.
 
 ## The problem
 
@@ -67,6 +67,8 @@ POST   /jobs                 submit a posting (URL or text), runs the pipeline
 GET    /jobs/{id}            requirements, fit analysis, and per-step detail
 GET    /jobs?status=applied  filter by application status or pipeline status
 PATCH  /jobs/{id}/status     update application status
+PUT    /resume               set the resume every job is compared against
+GET    /resume               the current parsed resume profile
 POST   /jobs/{id}/retry      re-run a dead-lettered job
 GET    /insights             aggregate skill gaps across all postings
 GET    /health               job counts by pipeline status
@@ -74,6 +76,10 @@ GET    /health               job counts by pipeline status
 
 `/insights` is the endpoint that makes this worth using. Not "what did this one
 job want" but "what do I keep missing across all of them."
+
+`PUT /resume` parses the resume into a skills profile with one LLM call and
+stores it. Re-uploading the same text returns the stored parse with
+`"parsed": false` and costs nothing. The response never echoes the raw text.
 
 `/jobs/{id}/retry` resets only the **failed** step. Completed steps stay
 completed, so retrying does not re-burn tokens on work that already succeeded.
@@ -120,6 +126,22 @@ server-side refusal fallbacks, which can route a declined request to another
 model. Cost is computed from `response.model`, not the requested one. An
 unpriced model fails before the call rather than after paying for it.
 
+**The resume is parsed once, not per job.** It belongs to the user, not to a
+posting, so it is stored in its own table and reused by every comparison
+instead of being a pipeline step that would re-bill the same call per job. A
+whitespace-insensitive content hash detects identical re-uploads. An offline
+placeholder parse never satisfies that check, so adding an API key later and
+re-uploading produces a real parse instead of a cached empty one.
+
+**Contact details have nowhere to land.** The resume profile schema has fields
+for skills, years of experience, titles, and education only, so a name, email,
+or phone number in the text cannot reach the database through the parse. The
+raw text is stored (to re-parse later) but never returned by the API.
+
+**Resume upload has no runner, so it does not retry.** It is a one-off,
+user-initiated call: a transient API failure returns `503` and the caller
+re-submits, rather than the request blocking through backoff.
+
 **`compare` and `score` are still stubs with fixed output shapes.** Swapping in
 real calls replaces their bodies only; the runner, API, and tests stay as they
 are.
@@ -137,6 +159,8 @@ implementations never measure them.
 src/
   models.py     SQLAlchemy models: Job and Step
   runner.py     pipeline execution, resume, retry, dead-letter
+  llm.py        Anthropic client, error mapping, pricing, offline mode
+  resume.py     resume parsing, stored once and reused by every job
   pipeline.py   the five step handlers
   db.py         engine and session setup
   api.py        FastAPI endpoints and startup recovery
@@ -145,11 +169,12 @@ tests/
   test_runner.py    12 tests on the execution engine
   test_api.py       12 tests on the HTTP layer
   test_extract.py   19 tests on extract error handling and offline mode
+  test_resume.py    12 tests on resume parsing, caching, and the endpoints
 ```
 
 ## Tests
 
-**43 tests, all passing, under a second.** No test touches the network: an
+**55 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 
 Two of them carry the project:
@@ -182,7 +207,7 @@ python -m pytest tests/ -v
 ```
 
 ```
-43 passed in 0.45s
+55 passed in 0.45s
 ```
 
 Start the service:
@@ -213,7 +238,7 @@ curl -X POST localhost:8000/jobs \
 - [x] Real LLM call in `extract` via the Anthropic API
 - [ ] Real LLM calls in `compare` and `score`
 - [ ] URL ingestion with timeout and bot-detection handling
-- [ ] Resume parsing to feed the comparison step
+- [x] Resume parsing to feed the comparison step
 - [ ] Structured JSON logging with `job_id` on every line
 - [ ] `/metrics`: job counts by status, p95 step latency, token spend
 - [ ] Dockerfile and compose setup

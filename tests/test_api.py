@@ -7,7 +7,6 @@ durability work in runner.py actually fires when the service boots.
 import os
 import sys
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -19,43 +18,6 @@ from src import api as api_module
 from src import db as db_module
 from src.models import Base, Job, JobStatus, Step, StepStatus
 from src.runner import PipelineRunner, StepFailed
-
-
-@pytest.fixture
-def client(monkeypatch):
-    """App wired to a throwaway in-memory database.
-
-    StaticPool keeps the single connection alive so the same :memory:
-    database is visible to the lifespan handler and the request handlers.
-    """
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    TestSession = sessionmaker(bind=engine, autoflush=False)
-    Base.metadata.create_all(engine)
-
-    monkeypatch.setattr(db_module, "engine", engine)
-    monkeypatch.setattr(db_module, "SessionLocal", TestSession)
-    monkeypatch.setattr(api_module, "SessionLocal", TestSession)
-    monkeypatch.setattr(db_module, "init_db", lambda: Base.metadata.create_all(engine))
-    monkeypatch.setattr(api_module, "init_db", lambda: Base.metadata.create_all(engine))
-
-    def override_session():
-        s = TestSession()
-        try:
-            yield s
-        finally:
-            s.close()
-
-    api_module.app.dependency_overrides[db_module.get_session] = override_session
-
-    with TestClient(api_module.app) as c:
-        c.session_factory = TestSession
-        yield c
-
-    api_module.app.dependency_overrides.clear()
 
 
 # ------------------------------------------------------------------

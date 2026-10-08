@@ -13,12 +13,19 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 os.environ["BACKOFF_DISABLED"] = "1"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src import pipeline  # noqa: E402
+from src import api as api_module  # noqa: E402
+from src import db as db_module  # noqa: E402
+from src import llm  # noqa: E402
+from src.models import Base  # noqa: E402
 
 FAKE_REQUIREMENTS = {
     "title": "Backend Engineer",
@@ -55,7 +62,7 @@ def make_response(text, stop_reason="end_turn", model=None, usage=(1200, 150)):
         content=[SimpleNamespace(type="text", text=text)],
         stop_reason=stop_reason,
         stop_details=None,
-        model=model or pipeline.EXTRACT_MODEL,
+        model=model or llm.MODEL,
         usage=SimpleNamespace(input_tokens=usage[0], output_tokens=usage[1]),
     )
 
@@ -64,7 +71,44 @@ def make_response(text, stop_reason="end_turn", model=None, usage=(1200, 150)):
 def fake_anthropic(monkeypatch):
     messages = FakeMessages()
     client = SimpleNamespace(beta=SimpleNamespace(messages=messages))
-    monkeypatch.setattr(pipeline, "get_client", lambda: client)
+    monkeypatch.setattr(llm, "get_client", lambda: client)
     # Behave as if a key is configured, regardless of the real environment.
-    monkeypatch.setattr(pipeline, "is_offline", lambda: False)
+    monkeypatch.setattr(llm, "is_offline", lambda: False)
     return messages
+
+
+@pytest.fixture
+def client(monkeypatch):
+    """App wired to a throwaway in-memory database.
+
+    StaticPool keeps the single connection alive so the same :memory:
+    database is visible to the lifespan handler and the request handlers.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    TestSession = sessionmaker(bind=engine, autoflush=False)
+    Base.metadata.create_all(engine)
+
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal", TestSession)
+    monkeypatch.setattr(api_module, "SessionLocal", TestSession)
+    monkeypatch.setattr(db_module, "init_db", lambda: Base.metadata.create_all(engine))
+    monkeypatch.setattr(api_module, "init_db", lambda: Base.metadata.create_all(engine))
+
+    def override_session():
+        s = TestSession()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    api_module.app.dependency_overrides[db_module.get_session] = override_session
+
+    with TestClient(api_module.app) as c:
+        c.session_factory = TestSession
+        yield c
+
+    api_module.app.dependency_overrides.clear()

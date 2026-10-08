@@ -125,3 +125,29 @@ class Step(Base):
     created_at = Column(DateTime, default=now_utc)
 
     job = relationship("Job", back_populates="steps")
+
+
+class Resume(Base):
+    """One parsed version of the user's resume. The newest row is current.
+
+    Parsed once per distinct text, not once per job: content_hash lets an
+    identical re-upload return the existing parse without paying for another
+    LLM call. Older versions are kept so a past comparison can be traced to
+    the resume it was made against.
+    """
+    __tablename__ = "resumes"
+
+    id = Column(String, primary_key=True, default=new_id)
+    raw_text = Column(Text, nullable=False)
+    content_hash = Column(String, nullable=False, index=True)
+
+    profile = Column(JSON, nullable=False)
+    # "offline" when parsed without an API key; such a row is a placeholder
+    # and must never satisfy the re-upload cache.
+    model = Column(String, nullable=False)
+
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    cost_usd = Column(Float, default=0.0)
+
+    created_at = Column(DateTime, default=now_utc)

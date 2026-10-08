@@ -9,3 +9,6 @@ venv/
 .pytest_cache/
 .DS_Store
 CLAUDE.md
+
+# Real personal data (your resume). Never committed.
+private/

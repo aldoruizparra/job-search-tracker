@@ -10,14 +10,18 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from datetime import datetime
+
 from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy.orm import Session
 
+from . import resume as resume_module
 from .db import SessionLocal, get_session, init_db
-from .models import ApplicationStatus, Job, JobStatus
+from .llm import ModelRefused
+from .models import ApplicationStatus, Job, JobStatus, Resume
 from .pipeline import STEPS
-from .runner import PipelineRunner
+from .runner import PipelineRunner, StepFailed
 
 log = logging.getLogger("api")
 
@@ -84,6 +88,44 @@ class JobOut(BaseModel):
 
 class StatusUpdate(BaseModel):
     application_status: ApplicationStatus
+
+
+class ResumeIn(BaseModel):
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def not_blank(cls, v):
+        if not v.strip():
+            raise ValueError("resume text is empty")
+        return v
+
+
+class ResumeOut(BaseModel):
+    id: str
+    profile: dict
+    model: str
+    chars: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    created_at: datetime
+    parsed: Optional[bool] = None   # set on upload: False means cache hit
+
+
+def resume_out(r: Resume, parsed: Optional[bool] = None) -> ResumeOut:
+    # raw_text is deliberately not returned: it may hold contact details.
+    return ResumeOut(
+        id=r.id,
+        profile=r.profile,
+        model=r.model,
+        chars=len(r.raw_text),
+        input_tokens=r.input_tokens or 0,
+        output_tokens=r.output_tokens or 0,
+        cost_usd=r.cost_usd or 0.0,
+        created_at=r.created_at,
+        parsed=parsed,
+    )
 
 
 def to_out(job: Job) -> JobOut:
@@ -195,6 +237,33 @@ def retry_job(job_id: str, session: Session = Depends(get_session)):
     return to_out(job)
 
 
+@app.put("/resume", response_model=ResumeOut)
+def put_resume(body: ResumeIn, session: Session = Depends(get_session)):
+    """Set the resume that every job is compared against.
+
+    Parsed with one LLM call and stored. Re-uploading the same text returns
+    the stored parse with parsed=false and costs nothing.
+
+    No runner here, so no automatic retry: a transient API failure returns
+    503 and the caller re-submits. This is a one-off, user-initiated call.
+    """
+    try:
+        resume, parsed = resume_module.upload(session, body.text)
+    except StepFailed as exc:
+        raise HTTPException(503, f"model API unavailable, try again: {exc}")
+    except ModelRefused as exc:
+        raise HTTPException(422, str(exc))
+    return resume_out(resume, parsed)
+
+
+@app.get("/resume", response_model=ResumeOut)
+def get_resume(session: Session = Depends(get_session)):
+    resume = resume_module.current(session)
+    if resume is None:
+        raise HTTPException(404, "no resume uploaded")
+    return resume_out(resume)
+
+
 @app.get("/insights")
 def insights(session: Session = Depends(get_session)):
     """Aggregate skill gaps across every posting tracked.
@@ -215,8 +284,11 @@ def insights(session: Session = Depends(get_session)):
         "jobs_analyzed": len(jobs),
         "top_gaps": [{"skill": s, "count": c} for s, c in missing.most_common(15)],
         "strengths": [{"skill": s, "count": c} for s, c in met.most_common(15)],
+        # resume parsing is LLM spend too, so it counts toward the total
         "total_cost_usd": round(
-            sum(j.total_cost_usd or 0.0 for j in session.query(Job).all()), 4
+            sum(j.total_cost_usd or 0.0 for j in session.query(Job).all())
+            + sum(r.cost_usd or 0.0 for r in session.query(Resume).all()),
+            4,
         ),
     }
 
