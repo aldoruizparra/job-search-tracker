@@ -50,6 +50,11 @@ The runner's core guarantee: **a crash is a pause, not a restart.**
 - Transient failures retry with exponential backoff **and jitter**.
 - A step that exhausts its attempts moves the job to `DEAD_LETTER` rather than
   disappearing, so failures stay inspectable and can be retried deliberately.
+- A handler that raises anything other than `StepFailed` is treated as a bug:
+  the step is marked `FAILED` on the first attempt and the job dead-letters
+  immediately. Retrying a bug pays for the same failure three times. A process
+  crash (`SystemExit`, Ctrl-C) is deliberately *not* caught, so the step stays
+  `RUNNING` and resumes on the next boot.
 
 The API wires `resume_all()` into the FastAPI lifespan handler. Without that
 call, the durability work never actually fires in production and crashed jobs
@@ -137,14 +142,14 @@ src/
   api.py        FastAPI endpoints and startup recovery
 tests/
   conftest.py       disables retry backoff, fakes the Anthropic client
-  test_runner.py    10 tests on the execution engine
-  test_api.py       11 tests on the HTTP layer
+  test_runner.py    12 tests on the execution engine
+  test_api.py       12 tests on the HTTP layer
   test_extract.py   19 tests on extract error handling and offline mode
 ```
 
 ## Tests
 
-**40 tests, all passing, under a second.** No test touches the network: an
+**43 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 
 Two of them carry the project:
@@ -164,7 +169,7 @@ transient API error becomes a retry, each client error, refusal, truncation,
 and malformed response does not, and a rate-limited extract retried through the
 real runner records three attempts but bills one call.
 
-Also covered: retry on transient failure, dead-letter after exhausted attempts,
+Also covered: handler bugs dead-lettering on the first attempt instead of being re-run on every restart, retry on transient failure, dead-letter after exhausted attempts,
 dead-letter jobs not silently retrying, cost rollup, output threading between
 steps, idempotency key stability, multiple stranded jobs recovered at once,
 request validation, status filtering, and insight aggregation.
@@ -177,7 +182,7 @@ python -m pytest tests/ -v
 ```
 
 ```
-40 passed in 0.41s
+43 passed in 0.45s
 ```
 
 Start the service:

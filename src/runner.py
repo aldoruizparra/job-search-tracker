@@ -216,6 +216,25 @@ class PipelineRunner:
                 if step.attempts < step.max_attempts:
                     time.sleep(self._backoff(step.attempts))
 
+            # Anything else is a bug: retrying it pays for the same failure
+            # again. Dead-letter now, so the job is inspectable instead of
+            # stranded in PROCESSING and re-run by resume_all() on every boot.
+            # Exception, not BaseException: SystemExit and KeyboardInterrupt
+            # are the process dying, and must leave the step RUNNING to resume.
+            except Exception as exc:
+                # The handler may have left the session mid-transaction.
+                self.session.rollback()
+                step.status = StepStatus.FAILED
+                step.error = f"{type(exc).__name__}: {exc}"
+                step.duration_ms = int((time.monotonic() - start) * 1000)
+                step.finished_at = now_utc()
+                self.session.commit()
+                log.exception(
+                    "step raised a non-retryable error",
+                    extra={"job_id": job.id, "step": step.step_name},
+                )
+                return False
+
         step.status = StepStatus.FAILED
         step.finished_at = now_utc()
         self.session.commit()

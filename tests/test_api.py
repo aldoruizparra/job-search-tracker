@@ -118,6 +118,21 @@ def test_url_only_job_dead_letters(client):
     assert body["steps"][0]["attempts"] == 3
 
 
+def test_malformed_model_response_dead_letters_instead_of_500(client, fake_anthropic):
+    from conftest import make_response
+
+    fake_anthropic.reply = make_response("not json")
+    r = client.post("/jobs", json={"raw_text": "posting"})
+    assert r.status_code == 201
+
+    body = r.json()
+    assert body["status"] == "dead_letter"
+    extract = next(s for s in body["steps"] if s["step_name"] == "extract")
+    assert extract["status"] == "failed"
+    assert extract["attempts"] == 1
+    assert extract["error"].startswith("JSONDecodeError")
+
+
 def test_retry_resets_only_the_failed_step(client):
     created = client.post("/jobs", json={"source_url": "https://example.com/job"}).json()
     assert created["status"] == "dead_letter"

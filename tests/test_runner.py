@@ -244,6 +244,58 @@ def test_idempotency_key_is_stable_and_input_sensitive():
     assert a != d          # different job, different key
 
 
+def test_handler_bug_dead_letters_without_retrying(session):
+    """A non-StepFailed exception is a bug: fail once, record it, stop."""
+    calls = []
+
+    def buggy(job, prior):
+        calls.append("buggy")
+        raise ValueError("malformed response")
+
+    downstream = []
+    steps = [("extract", buggy), ("compare", make_step("compare", downstream))]
+
+    job = Job(raw_text="posting")
+    session.add(job)
+    session.commit()
+
+    result = PipelineRunner(session, steps).run(job.id)
+
+    assert result.status == JobStatus.DEAD_LETTER
+    assert len(calls) == 1                     # not retried
+    assert downstream == []                    # later steps never ran
+    step = result.steps[0]
+    assert step.status == StepStatus.FAILED
+    assert step.attempts == 1
+    assert step.error == "ValueError: malformed response"
+
+
+def test_handler_bug_is_not_rerun_on_restart(session_factory):
+    """Before this was handled, a bug left the job PROCESSING and every boot
+    re-ran it through resume_all(), paying for the same failure again."""
+    calls = []
+
+    def buggy(job, prior):
+        calls.append("buggy")
+        raise ValueError("bug")
+
+    s1 = session_factory()
+    job = Job(raw_text="posting")
+    s1.add(job)
+    s1.commit()
+    job_id = job.id
+    PipelineRunner(s1, [("extract", buggy)]).run(job_id)
+    s1.close()
+
+    s2 = session_factory()
+    resumed = PipelineRunner(s2, [("extract", buggy)]).resume_all()
+
+    assert resumed == []
+    assert len(calls) == 1
+    assert s2.get(Job, job_id).status == JobStatus.DEAD_LETTER
+    s2.close()
+
+
 def test_resume_all_handles_multiple_stranded_jobs(session_factory):
     calls = []
     crashing = [("extract", make_step("extract", calls, crash=True))]
