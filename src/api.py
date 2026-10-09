@@ -8,14 +8,14 @@ the durability work in runner.py never actually fires in production.
 import logging
 from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
-from datetime import datetime
-
-from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, field_validator, model_validator
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel, model_validator
 from sqlalchemy.orm import Session
 
+from . import llm
 from . import resume as resume_module
 from .db import SessionLocal, get_session, init_db
 from .llm import ModelRefused
@@ -88,17 +88,6 @@ class JobOut(BaseModel):
 
 class StatusUpdate(BaseModel):
     application_status: ApplicationStatus
-
-
-class ResumeIn(BaseModel):
-    text: str
-
-    @field_validator("text")
-    @classmethod
-    def not_blank(cls, v):
-        if not v.strip():
-            raise ValueError("resume text is empty")
-        return v
 
 
 class ResumeOut(BaseModel):
@@ -237,23 +226,64 @@ def retry_job(job_id: str, session: Session = Depends(get_session)):
     return to_out(job)
 
 
-@app.put("/resume", response_model=ResumeOut)
-def put_resume(body: ResumeIn, session: Session = Depends(get_session)):
-    """Set the resume that every job is compared against.
-
-    Parsed with one LLM call and stored. Re-uploading the same text returns
-    the stored parse with parsed=false and costs nothing.
+def _parse_errors_to_http(fn, *args):
+    """Run a resume parse, mapping its failures to HTTP status codes.
 
     No runner here, so no automatic retry: a transient API failure returns
-    503 and the caller re-submits. This is a one-off, user-initiated call.
+    503 and the caller re-submits. These are one-off, user-initiated calls.
     """
     try:
-        resume, parsed = resume_module.upload(session, body.text)
+        return fn(*args)
     except StepFailed as exc:
         raise HTTPException(503, f"model API unavailable, try again: {exc}")
     except ModelRefused as exc:
         raise HTTPException(422, str(exc))
+
+
+@app.put("/resume", response_model=ResumeOut)
+def put_resume(
+    file: Optional[UploadFile] = File(None, description="resume as a PDF"),
+    text: Optional[str] = Form(None, description="resume as plain text"),
+    session: Session = Depends(get_session),
+):
+    """Set the resume that every job is compared against.
+
+    Send exactly one of `file` (a PDF) or `text`, as form fields:
+        curl -X PUT localhost:8000/resume -F "file=@private/resume.pdf"
+
+    The PDF is converted to text locally. The text is parsed with one LLM
+    call and stored. Re-uploading the same resume (as PDF or text) returns
+    the stored parse with parsed=false and costs nothing.
+    """
+    if (file is None) == (text is None):
+        raise HTTPException(422, "send exactly one of file (a PDF) or text")
+
+    if file is not None:
+        try:
+            text = resume_module.extract_pdf_text(file.file.read())
+        except resume_module.UnreadableResume as exc:
+            raise HTTPException(422, str(exc))
+    elif not text.strip():
+        raise HTTPException(422, "resume text is empty")
+
+    resume, parsed = _parse_errors_to_http(resume_module.upload, session, text)
     return resume_out(resume, parsed)
+
+
+@app.post("/resume/reparse", response_model=ResumeOut)
+def reparse_resume(session: Session = Depends(get_session)):
+    """Parse the current resume again, without uploading it again.
+
+    Use after adding an API key (the first upload without one stores an
+    empty placeholder) or after changing LLM_MODEL. Always makes a billed
+    call; that is the point of asking.
+    """
+    if resume_module.current(session) is None:
+        raise HTTPException(404, "no resume uploaded")
+    if llm.is_offline():
+        raise HTTPException(409, "no API key configured; a reparse would only store another placeholder")
+    resume = _parse_errors_to_http(resume_module.reparse, session)
+    return resume_out(resume, parsed=True)
 
 
 @app.get("/resume", response_model=ResumeOut)

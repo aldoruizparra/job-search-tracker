@@ -1,17 +1,22 @@
 """Resume parsing tests.
 
-The resume below is fabricated. Never put a real one in a fixture.
+The resume below is fabricated, and test PDFs are generated from it. Never
+put a real resume in a fixture.
 
 What matters: a resume is parsed once per distinct text (an identical
-re-upload costs nothing), an offline placeholder never masks a later real
-parse, and contact details have nowhere to land.
+re-upload costs nothing, PDF or text), an offline placeholder never masks a
+later real parse, a PDF without a text layer is rejected rather than stored
+empty, and contact details have nowhere to land.
 """
 
+import io
 import json
 
 import anthropic
 import httpx2
+import pypdf
 import pytest
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -116,6 +121,12 @@ def test_offline_placeholder_does_not_mask_a_later_real_parse(
     assert placeholder.profile["skills"] == []
     assert fake_anthropic.calls == []
 
+    # still offline: re-uploading reuses the placeholder, no duplicate row
+    same, parsed = resume_module.upload(session, FAKE_RESUME)
+    assert parsed is False
+    assert same.id == placeholder.id
+    assert session.query(Resume).count() == 1
+
     monkeypatch.setattr(llm, "is_offline", lambda: False)
     fake_anthropic.reply = profile_reply()
     real, parsed = resume_module.upload(session, FAKE_RESUME)
@@ -142,15 +153,118 @@ def test_transient_error_stores_nothing(session, fake_anthropic):
     assert session.query(Resume).count() == 0
 
 
+# ----------------------------------------------------------------- PDFs
+
+
+def make_pdf(text: str) -> bytes:
+    """A real PDF with `text` in its text layer, one line per line."""
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})
+    })
+    ops = ["BT", "/F1 10 Tf", "50 750 Td", "13 TL"]
+    for line in text.splitlines():
+        escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        ops.append(f"({escaped}) Tj T*")
+    ops.append("ET")
+    stream = DecodedStreamObject()
+    stream.set_data("\n".join(ops).encode("latin-1"))
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    return _write(writer)
+
+
+def blank_pdf() -> bytes:
+    """Stands in for a scanned resume: pages, but no text layer."""
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    return _write(writer)
+
+
+def _write(writer) -> bytes:
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def test_pdf_text_is_extracted():
+    text = resume_module.extract_pdf_text(make_pdf(FAKE_RESUME))
+    assert "Backend Engineer, Brightline Logistics, 2021 - present" in text
+    assert "PostgreSQL" in text
+
+
+def test_pdf_with_same_content_hashes_like_the_text():
+    """Re-exporting or pasting the same resume must not trigger a new parse."""
+    text = resume_module.extract_pdf_text(make_pdf(FAKE_RESUME))
+    assert resume_module.content_hash(text) == resume_module.content_hash(FAKE_RESUME)
+
+
+@pytest.mark.parametrize(
+    "data,reason",
+    [
+        (b"PK\x03\x04 this is a docx", "not a PDF"),
+        (blank_pdf(), "scanned"),
+        (b"%PDF-1.7\ngarbage that is not a real pdf body", "could not be read"),
+        (b"%PDF-" + b"0" * (resume_module.MAX_PDF_BYTES + 1), "over 5 MB"),
+    ],
+    ids=["not_pdf", "scanned", "corrupt", "too_big"],
+)
+def test_unusable_pdfs_are_rejected_with_a_reason(data, reason):
+    with pytest.raises(resume_module.UnreadableResume, match=reason):
+        resume_module.extract_pdf_text(data)
+
+
+def test_password_protected_pdf_is_rejected():
+    reader = pypdf.PdfReader(io.BytesIO(make_pdf(FAKE_RESUME)))
+    writer = pypdf.PdfWriter(clone_from=reader)
+    writer.encrypt("secret")
+    with pytest.raises(resume_module.UnreadableResume, match="password"):
+        resume_module.extract_pdf_text(_write(writer))
+
+
+# --------------------------------------------------------------- reparse
+
+
+def test_reparse_ignores_the_cache_and_keeps_history(session, fake_anthropic):
+    fake_anthropic.reply = profile_reply()
+    first, _ = resume_module.upload(session, FAKE_RESUME)
+
+    again = resume_module.reparse(session)
+
+    assert again.id != first.id
+    assert again.content_hash == first.content_hash
+    assert len(fake_anthropic.calls) == 2          # asked for, so billed
+    assert resume_module.current(session).id == again.id
+    assert session.query(Resume).count() == 2
+
+
+def test_reparse_with_nothing_uploaded_returns_none(session, fake_anthropic):
+    assert resume_module.reparse(session) is None
+    assert fake_anthropic.calls == []
+
+
 # ---------------------------------------------------------------- HTTP
 
 
 # client fixture: conftest.py
 
 
+def put_text(client, text):
+    return client.put("/resume", data={"text": text})
+
+
+def put_pdf(client, data, name="resume.pdf"):
+    return client.put("/resume", files={"file": (name, data, "application/pdf")})
+
+
 def test_put_resume_returns_profile_without_raw_text(client, fake_anthropic):
     fake_anthropic.reply = profile_reply()
-    r = client.put("/resume", json={"text": FAKE_RESUME})
+    r = put_text(client, FAKE_RESUME)
 
     assert r.status_code == 200
     body = r.json()
@@ -161,11 +275,54 @@ def test_put_resume_returns_profile_without_raw_text(client, fake_anthropic):
     assert "jordan.avery@example.com" not in r.text
 
 
+def test_put_pdf_resume_parses_its_text(client, fake_anthropic):
+    fake_anthropic.reply = profile_reply()
+    r = put_pdf(client, make_pdf(FAKE_RESUME))
+
+    assert r.status_code == 200
+    assert r.json()["profile"] == FAKE_PROFILE
+    sent = fake_anthropic.calls[0]["messages"][0]["content"]
+    assert "Brightline Logistics" in sent
+
+
+def test_pdf_then_same_text_is_a_free_cache_hit(client, fake_anthropic):
+    fake_anthropic.reply = profile_reply()
+    put_pdf(client, make_pdf(FAKE_RESUME))
+
+    r = put_text(client, FAKE_RESUME)
+    assert r.json()["parsed"] is False
+    assert len(fake_anthropic.calls) == 1
+
+
+def test_scanned_pdf_is_rejected_and_nothing_stored(client, fake_anthropic):
+    r = put_pdf(client, blank_pdf())
+
+    assert r.status_code == 422
+    assert "scanned" in r.json()["detail"]
+    assert fake_anthropic.calls == []
+    assert client.get("/resume").status_code == 404
+
+
+@pytest.mark.parametrize("payload", ["neither", "both"])
+def test_put_needs_exactly_one_of_file_or_text(client, fake_anthropic, payload):
+    if payload == "neither":
+        r = client.put("/resume")
+    else:
+        r = client.put(
+            "/resume",
+            data={"text": FAKE_RESUME},
+            files={"file": ("r.pdf", make_pdf(FAKE_RESUME), "application/pdf")},
+        )
+    assert r.status_code == 422
+    assert "exactly one" in r.json()["detail"]
+    assert fake_anthropic.calls == []
+
+
 def test_get_resume_404_until_uploaded(client, fake_anthropic):
     assert client.get("/resume").status_code == 404
 
     fake_anthropic.reply = profile_reply()
-    client.put("/resume", json={"text": FAKE_RESUME})
+    put_text(client, FAKE_RESUME)
 
     r = client.get("/resume")
     assert r.status_code == 200
@@ -173,13 +330,15 @@ def test_get_resume_404_until_uploaded(client, fake_anthropic):
 
 
 def test_put_blank_resume_is_rejected(client, fake_anthropic):
-    assert client.put("/resume", json={"text": "   \n "}).status_code == 422
+    r = put_text(client, "   \n ")
+    assert r.status_code == 422
+    assert "empty" in r.json()["detail"]
     assert fake_anthropic.calls == []
 
 
 def test_transient_api_error_returns_503(client, fake_anthropic):
     fake_anthropic.raises = [anthropic.APITimeoutError(request=REQUEST)]
-    r = client.put("/resume", json={"text": FAKE_RESUME})
+    r = put_text(client, FAKE_RESUME)
 
     assert r.status_code == 503
     assert client.get("/resume").status_code == 404
@@ -187,12 +346,36 @@ def test_transient_api_error_returns_503(client, fake_anthropic):
 
 def test_refusal_returns_422(client, fake_anthropic):
     fake_anthropic.reply = make_response("", stop_reason="refusal")
-    assert client.put("/resume", json={"text": FAKE_RESUME}).status_code == 422
+    r = put_text(client, FAKE_RESUME)
+    assert r.status_code == 422
+    assert "refused" in r.json()["detail"]
 
 
 def test_insights_total_includes_resume_spend(client, fake_anthropic):
     fake_anthropic.reply = profile_reply()
-    client.put("/resume", json={"text": FAKE_RESUME})
+    put_text(client, FAKE_RESUME)
 
     total = client.get("/insights").json()["total_cost_usd"]
     assert total == pytest.approx(round((900 * 4 + 120 * 20) / 1e6, 4))
+
+
+def test_reparse_endpoint_turns_offline_placeholder_into_real_parse(
+    client, fake_anthropic, monkeypatch
+):
+    """The path the user will actually take: upload with no key, add one,
+    reparse without uploading again."""
+    monkeypatch.setattr(llm, "is_offline", lambda: True)
+    assert put_text(client, FAKE_RESUME).json()["model"] == resume_module.OFFLINE
+    assert client.post("/resume/reparse").status_code == 409   # still no key
+
+    monkeypatch.setattr(llm, "is_offline", lambda: False)
+    fake_anthropic.reply = profile_reply()
+    r = client.post("/resume/reparse")
+
+    assert r.status_code == 200
+    assert r.json()["profile"] == FAKE_PROFILE
+    assert client.get("/resume").json()["model"] == llm.MODEL
+
+
+def test_reparse_endpoint_404_without_a_resume(client, fake_anthropic):
+    assert client.post("/resume/reparse").status_code == 404

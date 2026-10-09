@@ -67,8 +67,9 @@ POST   /jobs                 submit a posting (URL or text), runs the pipeline
 GET    /jobs/{id}            requirements, fit analysis, and per-step detail
 GET    /jobs?status=applied  filter by application status or pipeline status
 PATCH  /jobs/{id}/status     update application status
-PUT    /resume               set the resume every job is compared against
+PUT    /resume               set the resume (PDF or text) every job is compared against
 GET    /resume               the current parsed resume profile
+POST   /resume/reparse       parse the current resume again, e.g. after adding a key
 POST   /jobs/{id}/retry      re-run a dead-lettered job
 GET    /insights             aggregate skill gaps across all postings
 GET    /health               job counts by pipeline status
@@ -77,9 +78,19 @@ GET    /health               job counts by pipeline status
 `/insights` is the endpoint that makes this worth using. Not "what did this one
 job want" but "what do I keep missing across all of them."
 
-`PUT /resume` parses the resume into a skills profile with one LLM call and
-stores it. Re-uploading the same text returns the stored parse with
-`"parsed": false` and costs nothing. The response never echoes the raw text.
+`PUT /resume` takes a PDF or plain text as a form field, parses it into a skills
+profile with one LLM call, and stores it. Re-uploading the same resume, as PDF
+or text, returns the stored parse with `"parsed": false` and costs nothing. The
+response never echoes the raw text.
+
+```bash
+curl -X PUT localhost:8000/resume -F "file=@resume.pdf"
+curl -X PUT localhost:8000/resume -F "text=<resume.txt"
+```
+
+`POST /resume/reparse` re-runs the parse on the stored resume without a new
+upload. It always makes a billed call, so it refuses with `409` when no API key
+is configured rather than storing another empty placeholder.
 
 `/jobs/{id}/retry` resets only the **failed** step. Completed steps stay
 completed, so retrying does not re-burn tokens on work that already succeeded.
@@ -129,9 +140,21 @@ unpriced model fails before the call rather than after paying for it.
 **The resume is parsed once, not per job.** It belongs to the user, not to a
 posting, so it is stored in its own table and reused by every comparison
 instead of being a pipeline step that would re-bill the same call per job. A
-whitespace-insensitive content hash detects identical re-uploads. An offline
-placeholder parse never satisfies that check, so adding an API key later and
-re-uploading produces a real parse instead of a cached empty one.
+whitespace-insensitive content hash detects identical re-uploads. The hash is
+over the extracted text, not the file bytes, so re-exporting the same resume
+to a new PDF is still a cache hit. An offline placeholder satisfies that check
+only while still offline, so adding an API key later and re-uploading produces
+a real parse instead of a cached empty one.
+
+**PDFs are converted to text locally, not sent to the model.** `pypdf` is free,
+works offline, and keeps the exact wording, which later features that search
+the resume text depend on. Sending the PDF to Claude handles complex layouts
+(columns, tables) better and stays available as a fallback, but a single-column
+resume exported from Word extracts cleanly. Plain extraction mode, because
+layout mode pads words with spaces. A PDF with no text layer (a scan) is
+rejected with `422` instead of being stored as an empty resume. Hyperlink
+targets are not part of the extracted text, so a `mailto:` link left behind by
+an incomplete redaction never reaches the app.
 
 **Contact details have nowhere to land.** The resume profile schema has fields
 for skills, years of experience, titles, and education only, so a name, email,
@@ -169,13 +192,14 @@ tests/
   test_runner.py    12 tests on the execution engine
   test_api.py       12 tests on the HTTP layer
   test_extract.py   19 tests on extract error handling and offline mode
-  test_resume.py    12 tests on resume parsing, caching, and the endpoints
+  test_resume.py    28 tests on resume parsing, PDF extraction, caching, and the endpoints
 ```
 
 ## Tests
 
-**55 tests, all passing, under a second.** No test touches the network: an
+**71 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
+Test PDFs are generated in code from a fabricated resume.
 
 Two of them carry the project:
 
@@ -207,7 +231,7 @@ python -m pytest tests/ -v
 ```
 
 ```
-55 passed in 0.45s
+71 passed in 0.53s
 ```
 
 Start the service:
