@@ -226,6 +226,35 @@ def retry_job(job_id: str, session: Session = Depends(get_session)):
     return to_out(job)
 
 
+@app.post("/jobs/recompare")
+def recompare_jobs(session: Session = Depends(get_session)):
+    """Re-run compare, score, and store on every job made stale by a new resume.
+
+    A job is stale when its comparison used a different resume, or none.
+    Only those steps re-run; ingest and extract stay DONE, so the posting is
+    not re-billed. Calling it twice in a row does nothing the second time.
+    """
+    current = resume_module.current(session)
+    if current is None or current.model == resume_module.OFFLINE:
+        raise HTTPException(409, "no parsed resume to compare against; upload one first")
+
+    complete = session.query(Job).filter(Job.status == JobStatus.COMPLETE).all()
+    stale = [j for j in complete if (j.fit_analysis or {}).get("resume_id") != current.id]
+
+    runner = PipelineRunner(session, STEPS)
+    recompared, dead_lettered = [], []
+    for job in stale:
+        result = runner.rerun_from(job.id, "compare")
+        (recompared if result.status == JobStatus.COMPLETE else dead_lettered).append(job.id)
+
+    return {
+        "resume_id": current.id,
+        "recompared": recompared,
+        "dead_lettered": dead_lettered,
+        "already_current": len(complete) - len(stale),
+    }
+
+
 def _parse_errors_to_http(fn, *args):
     """Run a resume parse, mapping its failures to HTTP status codes.
 
@@ -301,7 +330,12 @@ def insights(session: Session = Depends(get_session)):
     This is the endpoint that makes the project worth using: not "what did
     this one job want" but "what do I keep missing across all of them".
     """
-    jobs = session.query(Job).filter(Job.fit_analysis.isnot(None)).all()
+    # A job compared without a resume has no gaps to count; including it
+    # would inflate jobs_analyzed without contributing anything.
+    jobs = [
+        j for j in session.query(Job).filter(Job.fit_analysis.isnot(None)).all()
+        if j.fit_analysis.get("mode") != "no_resume"
+    ]
 
     missing = Counter()
     met = Counter()

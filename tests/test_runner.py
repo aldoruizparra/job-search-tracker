@@ -318,3 +318,71 @@ def test_resume_all_handles_multiple_stranded_jobs(session_factory):
     assert len(resumed) == 3
     assert all(j.status == JobStatus.COMPLETE for j in resumed)
     s2.close()
+
+
+# ------------------------------------------------------------- rerun_from
+
+
+def three_steps(calls, crash_in=None):
+    return [
+        (name, make_step(name, calls, crash=(name == crash_in)))
+        for name in ("ingest", "extract", "compare")
+    ]
+
+
+def test_rerun_from_resets_that_step_and_later_only(session):
+    calls = []
+    job = Job(raw_text="posting")
+    session.add(job)
+    session.commit()
+    runner = PipelineRunner(session, three_steps(calls))
+    runner.run(job.id)
+
+    result = runner.rerun_from(job.id, "extract")
+
+    assert result.status == JobStatus.COMPLETE
+    assert calls == ["ingest", "extract", "compare", "extract", "compare"]
+    by_name = {s.step_name: s for s in result.steps}
+    assert by_name["ingest"].attempts == 1          # untouched, not re-run
+    assert by_name["extract"].attempts == 1         # reset, then run once
+    # job totals keep the history: the re-run steps cost again
+    assert result.total_input_tokens == 100 * 5
+
+
+def test_rerun_from_only_accepts_complete_jobs_and_known_steps(session):
+    calls = []
+    job = Job(raw_text="posting")
+    session.add(job)
+    session.commit()
+    runner = PipelineRunner(session, three_steps(calls))
+
+    with pytest.raises(ValueError, match="only complete jobs"):
+        runner.rerun_from(job.id, "extract")       # still PENDING
+
+    runner.run(job.id)
+    with pytest.raises(ValueError, match="unknown step"):
+        runner.rerun_from(job.id, "nope")
+
+
+def test_crash_during_rerun_resumes_without_rerunning_earlier_steps(session_factory):
+    """A rerun is durable like a first run: its reset is committed first."""
+    calls = []
+    s1 = session_factory()
+    job = Job(raw_text="posting")
+    s1.add(job)
+    s1.commit()
+    job_id = job.id
+    PipelineRunner(s1, three_steps(calls)).run(job_id)
+
+    with pytest.raises(SystemExit):
+        PipelineRunner(s1, three_steps(calls, crash_in="compare")).rerun_from(job_id, "extract")
+    s1.close()
+
+    s2 = session_factory()
+    resumed = PipelineRunner(s2, three_steps(calls)).resume_all()
+
+    assert [j.id for j in resumed] == [job_id]
+    assert resumed[0].status == JobStatus.COMPLETE
+    assert calls.count("ingest") == 1               # never re-run
+    assert calls.count("extract") == 2              # first run + rerun, not resumed again
+    s2.close()

@@ -13,13 +13,17 @@ Raise StepFailed for anything retryable (timeout, rate limit, transient 5xx).
 Let other exceptions propagate: those are bugs, not conditions to retry.
 
 extract makes a real Anthropic call through llm.structured_call, which owns
-the error mapping. compare and score are still stubs with their output shapes
-fixed; replacing them changes handler bodies only.
+the error mapping. compare and score are deterministic (no LLM): compare
+matches skill names against the current resume, score turns that into a
+number with reasoning.
 """
 
 import logging
 
+from sqlalchemy.orm import object_session
+
 from . import llm
+from . import resume as resume_module
 from .runner import StepFailed
 
 log = logging.getLogger("pipeline")
@@ -113,31 +117,118 @@ def extract(job, prior):
 # --------------------------------------------------------------- compare
 
 
+def _fold(skill: str) -> str:
+    """Case- and whitespace-insensitive key for matching skill names.
+
+    Deliberately exact otherwise: "k8s" does not match "Kubernetes" yet.
+    Synonym normalization is its own piece of work.
+    """
+    return " ".join(skill.split()).casefold()
+
+
 def compare(job, prior):
-    """Match extracted requirements against the resume."""
+    """Match extracted requirements against the current resume.
+
+    Deterministic, no LLM call, so it is free, works offline, and can be
+    re-run whenever the resume changes (see PipelineRunner.rerun_from).
+
+    With no usable resume (none uploaded, or only the offline placeholder,
+    whose empty skill list would mark everything missing) the job still
+    completes: the output carries the posting's priorities and no match.
+    """
     reqs = prior or {}
-    stub = {
-        "met": [],
-        "partial": [],
-        "missing": [],
-        "notes": "comparison not implemented yet",
+    required = reqs.get("required_skills") or []
+    preferred = reqs.get("preferred_skills") or []
+    priorities = {
+        "required": required,
+        "preferred": preferred,
+        "years_experience": reqs.get("years_experience"),
     }
-    log.info("compare stub", extra={"job_id": job.id, "skills": len(reqs.get("required_skills", []))})
-    return no_cost(stub)
+
+    current = resume_module.current(object_session(job))
+    if current is None or current.model == resume_module.OFFLINE:
+        log.info("compare without resume", extra={"job_id": job.id})
+        return no_cost({
+            "mode": "no_resume",
+            "resume_id": None,
+            "met": [],
+            "missing": [],
+            "partial": [],
+            "priorities": priorities,
+            "notes": "no parsed resume yet; showing what the posting prioritizes",
+        })
+
+    have = {_fold(s) for s in current.profile.get("skills", [])}
+    met_required = [s for s in required if _fold(s) in have]
+    met_preferred = [s for s in preferred if _fold(s) in have]
+    output = {
+        "mode": "resume",
+        "resume_id": current.id,
+        # met and missing are what /insights aggregates across jobs
+        "met": met_required + met_preferred,
+        "missing": [s for s in required if _fold(s) not in have],
+        "met_required": met_required,
+        "met_preferred": met_preferred,
+        "missing_preferred": [s for s in preferred if _fold(s) not in have],
+        "partial": [],   # reserved for synonym and fuzzy matches
+        "resume_years": current.profile.get("years_experience"),
+        "priorities": priorities,
+        "notes": "exact skill-name match, case-insensitive",
+    }
+    log.info(
+        "compare done",
+        extra={"job_id": job.id, "resume_id": current.id, "met": len(output["met"])},
+    )
+    return no_cost(output)
 
 
 # ----------------------------------------------------------------- score
 
 
-def score(job, prior):
-    """Produce a fit score with reasoning, not just a number."""
-    analysis = prior or {}
-    met = len(analysis.get("met", []))
-    missing = len(analysis.get("missing", []))
-    total = met + missing
+def _join(items: list) -> str:
+    return ", ".join(items) if items else "none listed"
 
-    value = round(met / total, 2) if total else 0.0
-    return no_cost({"fit_score": value, "reasoning": "scoring not implemented yet"})
+
+def score(job, prior):
+    """Produce a fit score with reasoning, not just a number.
+
+    The score is the share of *required* skills the resume shows. Preferred
+    skills and years go in the reasoning, not the number, so the number
+    stays easy to interpret. No score at all (None, not 0.0) when there is
+    no resume or the posting lists no required skills: a 0 would read as
+    "terrible fit" when the truth is "not measurable".
+    """
+    analysis = prior or {}
+    p = analysis.get("priorities") or {}
+    years = p.get("years_experience")
+    years_text = f"{years}+ years" if years is not None else "years not stated"
+
+    if analysis.get("mode") != "resume":
+        reasoning = (
+            f"No resume to compare against yet. This posting prioritizes: "
+            f"must have {_join(p.get('required', []))}; "
+            f"nice to have {_join(p.get('preferred', []))}; {years_text}."
+        )
+        return no_cost({"fit_score": None, "reasoning": reasoning})
+
+    required = p.get("required", [])
+    preferred = p.get("preferred", [])
+    met_req = analysis.get("met_required", [])
+    parts = []
+    if required:
+        parts.append(f"Matches {len(met_req)} of {len(required)} required skills")
+        if analysis.get("missing"):
+            parts.append(f"missing {_join(analysis['missing'])}")
+    else:
+        parts.append("Posting lists no required skills")
+    if preferred:
+        parts.append(f"{len(analysis.get('met_preferred', []))} of {len(preferred)} preferred")
+    resume_years = analysis.get("resume_years")
+    if years is not None and resume_years is not None:
+        parts.append(f"asks {years}+ years, resume shows {resume_years}")
+
+    value = round(len(met_req) / len(required), 2) if required else None
+    return no_cost({"fit_score": value, "reasoning": "; ".join(parts) + "."})
 
 
 # ----------------------------------------------------------------- store

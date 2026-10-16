@@ -6,8 +6,9 @@ persisted before and after execution, so a crash resumes from the last completed
 step instead of re-running expensive LLM calls.
 
 **Status: in progress.** The persistence layer, pipeline runner, and HTTP API are
-built and tested. `extract` and resume parsing make real Anthropic calls;
-`compare` and `score` are still stubs with their output shapes fixed.
+built and tested. `extract` and resume parsing make real Anthropic calls.
+`compare` and `score` are deterministic: exact skill-name matching against the
+parsed resume, with synonym handling ("k8s" = "Kubernetes") next.
 
 ## The problem
 
@@ -71,6 +72,7 @@ PUT    /resume               set the resume (PDF or text) every job is compared 
 GET    /resume               the current parsed resume profile
 POST   /resume/reparse       parse the current resume again, e.g. after adding a key
 POST   /jobs/{id}/retry      re-run a dead-lettered job
+POST   /jobs/recompare       re-compare every job made stale by a new resume
 GET    /insights             aggregate skill gaps across all postings
 GET    /health               job counts by pipeline status
 ```
@@ -94,6 +96,11 @@ is configured rather than storing another empty placeholder.
 
 `/jobs/{id}/retry` resets only the **failed** step. Completed steps stay
 completed, so retrying does not re-burn tokens on work that already succeeded.
+
+`POST /jobs/recompare` re-runs `compare`, `score`, and `store` on every
+completed job whose comparison used an older resume or none. `ingest` and
+`extract` stay done, so postings are not re-billed, and a second call right
+after does nothing.
 
 ## Design tradeoffs
 
@@ -165,9 +172,26 @@ raw text is stored (to re-parse later) but never returned by the API.
 user-initiated call: a transient API failure returns `503` and the caller
 re-submits, rather than the request blocking through backoff.
 
-**`compare` and `score` are still stubs with fixed output shapes.** Swapping in
-real calls replaces their bodies only; the runner, API, and tests stay as they
-are.
+**A job without a resume still completes.** `compare` records the posting's
+priorities (required skills, preferred skills, years asked) and `score`
+summarizes them, with `fit_score` left as `null`, not `0.0`. A zero would read
+as "terrible fit" when the truth is "not measurable yet". The offline
+placeholder resume counts as no resume, because its empty skill list would
+otherwise mark every skill missing and flood `/insights` with false gaps.
+
+**Re-running completed steps is allowed in exactly one, explicit way.**
+`PipelineRunner.rerun_from(job, step)` resets that step *and every step after
+it*, since each consumes the previous one's output, and never the steps
+before it. The reset is committed with the job in `PROCESSING` before anything
+runs, so a crash mid-rerun is recovered by `resume_all()` like any other crash.
+That is what `POST /jobs/recompare` uses when a new resume makes old
+comparisons stale.
+
+**The fit score counts only required skills.** Preferred skills and years go
+in the reasoning text, not the number, so `0.5` always means "half the
+must-haves". Matching is exact, ignoring only case and spacing. Fuzzy matching
+would raise scores, but it would also hide the vocabulary mismatches that the
+synonym work is meant to fix deliberately.
 
 **SQLite for now.** Single user, single process, no concurrency pressure. The
 SQLAlchemy models move to Postgres unchanged if that assumption breaks.
@@ -189,15 +213,16 @@ src/
   api.py        FastAPI endpoints and startup recovery
 tests/
   conftest.py       disables retry backoff, fakes the Anthropic client
-  test_runner.py    12 tests on the execution engine
+  test_runner.py    15 tests on the execution engine, including rerun_from
   test_api.py       12 tests on the HTTP layer
   test_extract.py   19 tests on extract error handling and offline mode
   test_resume.py    28 tests on resume parsing, PDF extraction, caching, and the endpoints
+  test_compare.py   12 tests on compare, score, recompare, and insights
 ```
 
 ## Tests
 
-**71 tests, all passing, under a second.** No test touches the network: an
+**86 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 Test PDFs are generated in code from a fabricated resume.
 
@@ -218,6 +243,10 @@ transient API error becomes a retry, each client error, refusal, truncation,
 and malformed response does not, and a rate-limited extract retried through the
 real runner records three attempts but bills one call.
 
+`test_crash_during_rerun_resumes_without_rerunning_earlier_steps` extends the
+core guarantee to deliberate re-runs: it crashes a rerun partway through and
+asserts the recovered job never re-ran the steps before the rerun point.
+
 Also covered: handler bugs dead-lettering on the first attempt instead of being re-run on every restart, retry on transient failure, dead-letter after exhausted attempts,
 dead-letter jobs not silently retrying, cost rollup, output threading between
 steps, idempotency key stability, multiple stranded jobs recovered at once,
@@ -231,7 +260,7 @@ python -m pytest tests/ -v
 ```
 
 ```
-71 passed in 0.53s
+86 passed in 0.83s
 ```
 
 Start the service:
@@ -260,9 +289,13 @@ curl -X POST localhost:8000/jobs \
 ## What is next
 
 - [x] Real LLM call in `extract` via the Anthropic API
-- [ ] Real LLM calls in `compare` and `score`
+- [x] Resume parsing, from PDF or text, to feed the comparison step
+- [x] Deterministic `compare` and `score`, with a no-resume path and re-compare
+- [ ] Skill-name synonyms ("k8s" = "Kubernetes")
+- [ ] Wording gap vs. skill gap: "on your resume but phrased differently" vs. "not on it"
+- [ ] "What to learn next", ranked by how many postings a skill would unlock
+- [ ] Which resume version led to screens and interviews
 - [ ] URL ingestion with timeout and bot-detection handling
-- [x] Resume parsing to feed the comparison step
 - [ ] Structured JSON logging with `job_id` on every line
 - [ ] `/metrics`: job counts by status, p95 step latency, token spend
 - [ ] Dockerfile and compose setup

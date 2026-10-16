@@ -130,6 +130,48 @@ class PipelineRunner:
         log.info("resuming stranded jobs", extra={"count": len(stranded)})
         return [self.run(job.id) for job in stranded]
 
+    def rerun_from(self, job_id: str, step_name: str) -> Job:
+        """Deliberately re-run a completed job from `step_name` onward.
+
+        The one sanctioned exception to "completed steps are never
+        re-executed", for when an input outside the pipeline changed (the
+        resume) and later steps are stale. Every step after `step_name` is
+        reset too, because each consumes the previous one's output. Steps
+        before it stay DONE and are not re-run or re-billed.
+
+        The reset is committed before running, with the job in PROCESSING, so
+        a crash mid-rerun is picked up by resume_all() like any other.
+        """
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise ValueError(f"no job {job_id}")
+        if job.status != JobStatus.COMPLETE:
+            raise ValueError(f"job {job_id} is {job.status.value}; only complete jobs rerun")
+        names = [name for name, _ in self.steps]
+        if step_name not in names:
+            raise ValueError(f"unknown step {step_name}")
+
+        first = names.index(step_name)
+        for step in job.steps:
+            if step.step_number >= first:
+                step.status = StepStatus.PENDING
+                step.attempts = 0
+                step.error = None
+                step.output_data = None
+                # Job totals keep the full history of spend; the step row
+                # describes only its latest run.
+                step.input_tokens = 0
+                step.output_tokens = 0
+                step.cost_usd = 0.0
+                step.duration_ms = None
+                step.started_at = None
+                step.finished_at = None
+        job.status = JobStatus.PROCESSING
+        self.session.commit()
+
+        log.info("rerunning job", extra={"job_id": job_id, "from_step": step_name})
+        return self.run(job_id)
+
     # ----- internals ----------------------------------------------------
 
     def _get_or_create_step(self, job, index, step_name, prior_output):
