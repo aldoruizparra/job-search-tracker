@@ -8,7 +8,7 @@ Kubernetes, and wants 3+ years.
 import json
 
 from conftest import FAKE_REQUIREMENTS, make_response
-from src import llm
+from src import llm, skills
 from src.models import Job
 
 PROFILE = {
@@ -202,3 +202,67 @@ def test_insights_ignores_jobs_compared_without_a_resume(client, fake_anthropic)
     body = client.get("/insights").json()
     assert body["jobs_analyzed"] == 1
     assert body["top_gaps"] == [{"skill": "AWS", "count": 1}]
+
+
+# ------------------------------------------------- skill normalization
+
+
+def test_synonyms_match_and_are_reported_canonically(client, fake_anthropic):
+    upload_resume(client, fake_anthropic, profile={**PROFILE, "skills": ["Kubernetes", "golang"]})
+    fake_anthropic.reply = make_response(json.dumps(
+        {**FAKE_REQUIREMENTS, "required_skills": ["k8s", "Go"], "preferred_skills": []}
+    ))
+
+    body = post_job(client)
+    assert body["fit_analysis"]["met_required"] == ["Kubernetes", "Go"]
+    assert body["fit_score"] == 1.0
+
+
+def test_broader_resume_skill_is_partial_and_not_counted(client, fake_anthropic):
+    upload_resume(client, fake_anthropic, profile={**PROFILE, "skills": ["AWS"]})
+    fake_anthropic.reply = make_response(json.dumps(
+        {**FAKE_REQUIREMENTS, "required_skills": ["AWS Lambda", "AWS"], "preferred_skills": []}
+    ))
+
+    body = post_job(client)
+    analysis = body["fit_analysis"]
+    assert analysis["met_required"] == ["AWS"]
+    assert analysis["partial_required"] == [{"skill": "AWS Lambda", "have": "AWS"}]
+    assert analysis["missing"] == []
+    assert body["fit_score"] == 0.5
+
+    s = client.session_factory()
+    job = s.get(Job, body["id"])
+    reasoning = next(st for st in job.steps if st.step_name == "score").output_data["reasoning"]
+    s.close()
+    assert "only broadly: AWS Lambda (resume shows AWS)" in reasoning
+
+
+def test_insights_counts_spelling_variants_as_one_skill(client, fake_anthropic):
+    post_job(client)
+    post_job(client, text="Another fabricated posting")
+    s = client.session_factory()
+    for job, missing in zip(s.query(Job).all(), [["k8s", "Go"], ["Kubernetes"]]):
+        job.fit_analysis = {"mode": "resume", "met": [], "missing": missing}
+    s.commit()
+    s.close()
+
+    gaps = client.get("/insights").json()["top_gaps"]
+    assert gaps[0] == {"skill": "Kubernetes", "count": 2}
+
+
+def test_recompare_picks_up_a_changed_skills_table(client, fake_anthropic):
+    """Editing skills.py must not need a new resume to take effect."""
+    upload_resume(client, fake_anthropic)
+    job = post_job(client)
+
+    s = client.session_factory()
+    row = s.get(Job, job["id"])
+    row.fit_analysis = {**row.fit_analysis, "skills_version": "older-table"}
+    s.commit()
+    s.close()
+
+    r = client.post("/jobs/recompare").json()
+    assert r["recompared"] == [job["id"]]
+    after = client.get(f"/jobs/{job['id']}").json()
+    assert after["fit_analysis"]["skills_version"] == skills.VERSION

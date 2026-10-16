@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from . import llm
 from . import resume as resume_module
+from . import skills
 from .db import SessionLocal, get_session, init_db
 from .llm import ModelRefused
 from .models import ApplicationStatus, Job, JobStatus, Resume
@@ -228,18 +229,26 @@ def retry_job(job_id: str, session: Session = Depends(get_session)):
 
 @app.post("/jobs/recompare")
 def recompare_jobs(session: Session = Depends(get_session)):
-    """Re-run compare, score, and store on every job made stale by a new resume.
+    """Re-run compare, score, and store on every job with a stale comparison.
 
-    A job is stale when its comparison used a different resume, or none.
-    Only those steps re-run; ingest and extract stay DONE, so the posting is
-    not re-billed. Calling it twice in a row does nothing the second time.
+    A comparison is stale when it used a different resume (or none), or an
+    older version of the skill-name tables in skills.py. Only those steps
+    re-run; ingest and extract stay DONE, so the posting is not re-billed.
+    Calling it twice in a row does nothing the second time.
     """
     current = resume_module.current(session)
     if current is None or current.model == resume_module.OFFLINE:
         raise HTTPException(409, "no parsed resume to compare against; upload one first")
 
+    def is_stale(job):
+        analysis = job.fit_analysis or {}
+        return (
+            analysis.get("resume_id") != current.id
+            or analysis.get("skills_version") != skills.VERSION
+        )
+
     complete = session.query(Job).filter(Job.status == JobStatus.COMPLETE).all()
-    stale = [j for j in complete if (j.fit_analysis or {}).get("resume_id") != current.id]
+    stale = [j for j in complete if is_stale(j)]
 
     runner = PipelineRunner(session, STEPS)
     recompared, dead_lettered = [], []
@@ -341,8 +350,11 @@ def insights(session: Session = Depends(get_session)):
     met = Counter()
     for job in jobs:
         analysis = job.fit_analysis or {}
-        missing.update(analysis.get("missing", []))
-        met.update(analysis.get("met", []))
+        # Normalized at read time too, so comparisons stored before a
+        # skills-table change still count "k8s" and "Kubernetes" together.
+        # canonical_list also dedupes, so one job counts a skill once.
+        missing.update(skills.canonical_list(analysis.get("missing", [])))
+        met.update(skills.canonical_list(analysis.get("met", [])))
 
     return {
         "jobs_analyzed": len(jobs),

@@ -7,8 +7,8 @@ step instead of re-running expensive LLM calls.
 
 **Status: in progress.** The persistence layer, pipeline runner, and HTTP API are
 built and tested. `extract` and resume parsing make real Anthropic calls.
-`compare` and `score` are deterministic: exact skill-name matching against the
-parsed resume, with synonym handling ("k8s" = "Kubernetes") next.
+`compare` and `score` are deterministic: skill names are normalized ("k8s" =
+"Kubernetes") and matched against the parsed resume, with no LLM call.
 
 ## The problem
 
@@ -72,7 +72,7 @@ PUT    /resume               set the resume (PDF or text) every job is compared 
 GET    /resume               the current parsed resume profile
 POST   /resume/reparse       parse the current resume again, e.g. after adding a key
 POST   /jobs/{id}/retry      re-run a dead-lettered job
-POST   /jobs/recompare       re-compare every job made stale by a new resume
+POST   /jobs/recompare       re-compare jobs made stale by a new resume or skills table
 GET    /insights             aggregate skill gaps across all postings
 GET    /health               job counts by pipeline status
 ```
@@ -98,7 +98,8 @@ is configured rather than storing another empty placeholder.
 completed, so retrying does not re-burn tokens on work that already succeeded.
 
 `POST /jobs/recompare` re-runs `compare`, `score`, and `store` on every
-completed job whose comparison used an older resume or none. `ingest` and
+completed job whose comparison used an older resume (or none) or an older
+version of the skill-name tables. `ingest` and
 `extract` stay done, so postings are not re-billed, and a second call right
 after does nothing.
 
@@ -189,9 +190,26 @@ comparisons stale.
 
 **The fit score counts only required skills.** Preferred skills and years go
 in the reasoning text, not the number, so `0.5` always means "half the
-must-haves". Matching is exact, ignoring only case and spacing. Fuzzy matching
-would raise scores, but it would also hide the vocabulary mismatches that the
-synonym work is meant to fix deliberately.
+must-haves".
+
+**Skill names are normalized with explicit tables, not fuzzy matching or an
+LLM.** `src/skills.py` holds an alias table ("k8s", "kube" → Kubernetes) and a
+parent table (AWS Lambda implies AWS, PostgreSQL implies SQL). Lookups ignore
+case, spaces, hyphens, and dots, but not `#` or `+`, so C, C++, and C# stay
+distinct. A narrower skill on the resume meets a broader requirement; the
+reverse (asks for Lambda, resume says AWS) is reported as `partial` and not
+counted, so the score is never inflated. Fuzzy string matching would confuse
+Java with JavaScript; an LLM call would make every comparison cost money and
+vary between runs. A table is boring, auditable, and testable, and an
+ambiguous alias or parent cycle fails at import rather than mismatching
+silently.
+
+**Raw outputs are never rewritten; normalization is applied on read.** What
+`extract` and resume parsing returned is stored as returned. The tables carry
+an automatic version (a hash of their contents) recorded on each comparison,
+so improving them and calling `/jobs/recompare` re-applies them without
+re-parsing a single posting. `/insights` also normalizes when it counts, so
+comparisons stored under an older table still aggregate correctly.
 
 **SQLite for now.** Single user, single process, no concurrency pressure. The
 SQLAlchemy models move to Postgres unchanged if that assumption breaks.
@@ -208,6 +226,7 @@ src/
   runner.py     pipeline execution, resume, retry, dead-letter
   llm.py        Anthropic client, error mapping, pricing, offline mode
   resume.py     resume parsing, stored once and reused by every job
+  skills.py     skill-name aliases and parents; canonical() and match()
   pipeline.py   the five step handlers
   db.py         engine and session setup
   api.py        FastAPI endpoints and startup recovery
@@ -217,12 +236,13 @@ tests/
   test_api.py       12 tests on the HTTP layer
   test_extract.py   19 tests on extract error handling and offline mode
   test_resume.py    28 tests on resume parsing, PDF extraction, caching, and the endpoints
-  test_compare.py   12 tests on compare, score, recompare, and insights
+  test_compare.py   16 tests on compare, score, recompare, and insights
+  test_skills.py    25 tests on skill normalization and table integrity
 ```
 
 ## Tests
 
-**86 tests, all passing, under a second.** No test touches the network: an
+**115 tests, all passing, under a second.** No test touches the network: an
 autouse fixture in `conftest.py` replaces the Anthropic client with a fake.
 Test PDFs are generated in code from a fabricated resume.
 
@@ -260,7 +280,7 @@ python -m pytest tests/ -v
 ```
 
 ```
-86 passed in 0.83s
+115 passed in 0.92s
 ```
 
 Start the service:
@@ -291,7 +311,7 @@ curl -X POST localhost:8000/jobs \
 - [x] Real LLM call in `extract` via the Anthropic API
 - [x] Resume parsing, from PDF or text, to feed the comparison step
 - [x] Deterministic `compare` and `score`, with a no-resume path and re-compare
-- [ ] Skill-name synonyms ("k8s" = "Kubernetes")
+- [x] Skill-name normalization ("k8s" = "Kubernetes", Lambda implies AWS)
 - [ ] Wording gap vs. skill gap: "on your resume but phrased differently" vs. "not on it"
 - [ ] "What to learn next", ranked by how many postings a skill would unlock
 - [ ] Which resume version led to screens and interviews

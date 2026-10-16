@@ -14,8 +14,8 @@ Let other exceptions propagate: those are bugs, not conditions to retry.
 
 extract makes a real Anthropic call through llm.structured_call, which owns
 the error mapping. compare and score are deterministic (no LLM): compare
-matches skill names against the current resume, score turns that into a
-number with reasoning.
+matches normalized skill names (skills.py) against the current resume, score
+turns that into a number with reasoning.
 """
 
 import logging
@@ -24,6 +24,7 @@ from sqlalchemy.orm import object_session
 
 from . import llm
 from . import resume as resume_module
+from . import skills
 from .runner import StepFailed
 
 log = logging.getLogger("pipeline")
@@ -117,28 +118,24 @@ def extract(job, prior):
 # --------------------------------------------------------------- compare
 
 
-def _fold(skill: str) -> str:
-    """Case- and whitespace-insensitive key for matching skill names.
-
-    Deliberately exact otherwise: "k8s" does not match "Kubernetes" yet.
-    Synonym normalization is its own piece of work.
-    """
-    return " ".join(skill.split()).casefold()
-
-
 def compare(job, prior):
     """Match extracted requirements against the current resume.
 
     Deterministic, no LLM call, so it is free, works offline, and can be
-    re-run whenever the resume changes (see PipelineRunner.rerun_from).
+    re-run whenever the resume or the skill tables change (see
+    PipelineRunner.rerun_from). Skill names are normalized through
+    skills.py, and every name in the output is canonical, so /insights can
+    count "k8s" and "Kubernetes" as one skill.
 
     With no usable resume (none uploaded, or only the offline placeholder,
     whose empty skill list would mark everything missing) the job still
     completes: the output carries the posting's priorities and no match.
     """
     reqs = prior or {}
-    required = reqs.get("required_skills") or []
-    preferred = reqs.get("preferred_skills") or []
+    required = skills.canonical_list(reqs.get("required_skills") or [])
+    preferred = skills.canonical_list(reqs.get("preferred_skills") or [])
+    # A skill listed as both required and preferred counts as required.
+    preferred = [p for p in preferred if skills.key(p) not in {skills.key(r) for r in required}]
     priorities = {
         "required": required,
         "preferred": preferred,
@@ -151,6 +148,7 @@ def compare(job, prior):
         return no_cost({
             "mode": "no_resume",
             "resume_id": None,
+            "skills_version": skills.VERSION,
             "met": [],
             "missing": [],
             "partial": [],
@@ -158,22 +156,25 @@ def compare(job, prior):
             "notes": "no parsed resume yet; showing what the posting prioritizes",
         })
 
-    have = {_fold(s) for s in current.profile.get("skills", [])}
-    met_required = [s for s in required if _fold(s) in have]
-    met_preferred = [s for s in preferred if _fold(s) in have]
+    have = current.profile.get("skills", [])
+    req = skills.match(required, have)
+    pref = skills.match(preferred, have)
     output = {
         "mode": "resume",
         "resume_id": current.id,
+        "skills_version": skills.VERSION,
         # met and missing are what /insights aggregates across jobs
-        "met": met_required + met_preferred,
-        "missing": [s for s in required if _fold(s) not in have],
-        "met_required": met_required,
-        "met_preferred": met_preferred,
-        "missing_preferred": [s for s in preferred if _fold(s) not in have],
-        "partial": [],   # reserved for synonym and fuzzy matches
+        "met": req["met"] + pref["met"],
+        "missing": req["missing"],
+        "met_required": req["met"],
+        "met_preferred": pref["met"],
+        "missing_preferred": pref["missing"],
+        # resume shows only a broader skill: reported, not counted as met
+        "partial": req["partial"] + pref["partial"],
+        "partial_required": req["partial"],
         "resume_years": current.profile.get("years_experience"),
         "priorities": priorities,
-        "notes": "exact skill-name match, case-insensitive",
+        "notes": f"normalized skill match, skills table {skills.VERSION}",
     }
     log.info(
         "compare done",
@@ -219,6 +220,10 @@ def score(job, prior):
         parts.append(f"Matches {len(met_req)} of {len(required)} required skills")
         if analysis.get("missing"):
             parts.append(f"missing {_join(analysis['missing'])}")
+        partial = analysis.get("partial_required", [])
+        if partial:
+            shown = ", ".join(f"{p['skill']} (resume shows {p['have']})" for p in partial)
+            parts.append(f"only broadly: {shown}")
     else:
         parts.append("Posting lists no required skills")
     if preferred:
